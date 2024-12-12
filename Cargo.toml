@@ -1,0 +1,23 @@
+[package]
+name = "snapshot-channel"
+version = "0.1.2"
+edition = "2021"
+
+authors = ["lino <lino_snsalias@outlook.com>"]
+description = "A channel that shares reference of the output of a future."
+repository = "https://github.com/ljsnogard/snapshot-channel-rs"
+keywords = ["async", "channel"]
+categories = ["no-std"]
+license = "MIT/Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+pincol = { git = "https://github.com/ljsnogard/pincol.git", branch = "dev/0.1.2" }
+
+pin-project = { version = "1.1.*" }
+
+[dev-dependencies]
+futures-lite = { version = "2" }
+tokio = { version = "1", features = ["full"] }
+log = { version = "0.4.*" }
+env_logger = { version = "0.11.*" }
