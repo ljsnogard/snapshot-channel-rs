@@ -1,6 +1,6 @@
 [package]
 name = "snapshot-channel"
-version = "0.1.2"
+version = "0.0.1"
 edition = "2021"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
