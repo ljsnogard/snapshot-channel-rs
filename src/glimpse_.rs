@@ -10,6 +10,7 @@ use core::{
 };
 
 use pin_project::pin_project;
+use pin_utils::pin_mut;
 
 use abs_sync::{
     cancellation::{CancelledToken, TrCancellationToken},
@@ -19,7 +20,7 @@ use atomex::{StrictOrderings, TrAtomicFlags, TrCmpxchOrderings};
 use atomic_sync::mutex::embedded::{MsbAsMutexSignal, SpinningMutexBorrowed};
 use pincol::{
     linked_list::{PinnedList, PinnedSlot},
-    x_deps::{abs_sync, atomex, atomic_sync},
+    x_deps::{abs_sync, atomex, atomic_sync, pin_utils},
 };
 
 use crate::Snapshot;
@@ -103,9 +104,10 @@ where
             waker.wake();
             true
         }
-
         let mutex = self.wake_queue_.mutex();
-        let mut g = mutex.acquire().wait();
+        let acq = mutex.acquire();
+        pin_mut!(acq);
+        let mut g = acq.lock().wait();
         let queue_pin = (*g).as_mut();
         let _ = queue_pin.clear(wake_);
     }
@@ -310,7 +312,9 @@ mod tests_ {
         assert!(StUtils::expect_mutex_released(v));
 
         let f_mutex = glimpse.mutex();
-        let g = f_mutex.acquire().wait();
+        let acq = f_mutex.acquire();
+        pin_mut!(acq);
+        let g = acq.lock().wait();
         let v = state.value();
         assert!(StUtils::expect_mutex_acquired(v));
         drop(g);

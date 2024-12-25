@@ -78,7 +78,9 @@ where
                 NonNull::new_unchecked(p)
             };
             let mutex = q.mutex();
-            let mut g = mutex.acquire().wait();
+            let acq = mutex.acquire();
+            pin_mut!(acq);
+            let mut g = acq.lock().wait();
             let slot_pin = unsafe { Pin::new_unchecked(slot_ptr.as_mut()) };
             let Option::Some(mut cursor) = (*g).as_mut().find(slot_pin) else {
                 unreachable!()
@@ -264,7 +266,9 @@ where
                     break Poll::Ready(Option::None);
                 }
                 let f_mutex = glimpse.mutex();
-                let Option::Some(mut f_guard) = f_mutex.try_acquire()
+                let acq_f = f_mutex.acquire();
+                pin_mut!(acq_f);
+                let Option::Some(mut f_guard) = acq_f.as_mut().try_lock()
                 else {
                     continue;
                 };
@@ -334,8 +338,10 @@ where
                         break Poll::Ready(Option::None)
                     };
                 }
-                let opt_g = q_mutex
-                    .acquire()
+                let acq_q = q_mutex.acquire();
+                pin_mut!(acq_q);
+                let opt_g = acq_q
+                    .lock()
                     .may_cancel_with(this.cancel_.as_mut());
                 let Option::Some(mut g) = opt_g else {
                     #[cfg(test)]
