@@ -17,7 +17,6 @@ use atomex::{StrictOrderings, TrAtomicFlags, TrCmpxchOrderings};
 use pincol::x_deps::{abs_sync, atomex, pin_utils};
 
 use crate::glimpse_::FutOrOutProj;
-
 use super::glimpse_::{FutOrOut, Glimpse, StUtils, PeekTask, WakerSlot};
 
 /// The viewer of the channel output
@@ -268,7 +267,7 @@ where
                 let f_mutex = glimpse.mutex();
                 let acq_f = f_mutex.acquire();
                 pin_mut!(acq_f);
-                let Option::Some(mut f_guard) = acq_f.as_mut().try_lock()
+                let Option::Some(mut f_guard) = acq_f.try_lock()
                 else {
                     continue;
                 };

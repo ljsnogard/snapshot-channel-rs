@@ -312,9 +312,9 @@ mod tests_ {
         assert!(StUtils::expect_mutex_released(v));
 
         let f_mutex = glimpse.mutex();
-        let acq = f_mutex.acquire();
-        pin_mut!(acq);
-        let g = acq.lock().wait();
+        let acq_f = f_mutex.acquire();
+        pin_mut!(acq_f);
+        let g = acq_f.lock().wait();
         let v = state.value();
         assert!(StUtils::expect_mutex_acquired(v));
         drop(g);
