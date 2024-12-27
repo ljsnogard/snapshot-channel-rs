@@ -1,4 +1,5 @@
 use core::{
+    fmt,
     future::Future,
     marker::PhantomData,
     mem,
@@ -121,6 +122,21 @@ where
             let p = queue.get_unchecked_mut() as *mut WakeQueue<O> as *mut u8;
             let p_glimpse = p.byte_sub(offset) as *mut Self;
             NonNull::new_unchecked(p_glimpse)
+        }
+    }
+}
+
+impl<F, O> fmt::Debug for Glimpse<F, O>
+where
+    F: Future,
+    F::Output: fmt::Debug,
+    O: TrCmpxchOrderings,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Option::Some(x) = self.try_peek() {
+            write!(f, "Glimpse({x:?}@{self:p})")
+        } else {
+            write!(f, "Glimpse@{self:p}")
         }
     }
 }

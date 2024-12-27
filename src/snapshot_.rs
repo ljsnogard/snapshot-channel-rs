@@ -1,5 +1,6 @@
 use core::{
     borrow::Borrow,
+    fmt,
     future::{Future, IntoFuture},
     marker::PhantomData,
     pin::Pin,
@@ -103,6 +104,18 @@ where
 {
     fn clone(&self) -> Self {
         Snapshot::new(self.glimpse_ref_.clone())
+    }
+}
+
+impl<B, F, O> fmt::Debug for Snapshot<B, F, O>
+where
+    B: Borrow<Glimpse<F, O>>,
+    F: Future,
+    F::Output: fmt::Debug,
+    O: TrCmpxchOrderings,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Snapshot({:?})", self.glimpse())
     }
 }
 
