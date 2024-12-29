@@ -14,6 +14,7 @@
 //! let glimpse = Glimpse::<_, StrictOrderings>::new(rx.recv());
 //! let snapshot = glimpse.snapshot();
 //! let snapshot_cloned = snapshot.clone();
+//! pin_mut!(glimpse);
 //!
 //! assert!(snapshot.try_peek().is_none());
 //! assert!(snapshot_cloned.try_peek().is_none());
@@ -29,6 +30,8 @@
 //!
 //! // Multiple times of peek_async is legal and idempotent
 //! assert!(snapshot.peek_async().await.is_some());
+//! 
+//! assert!(glimpse.fade_async().await.is_ok());
 //! ```
 
 #![feature(try_trait_v2)]
@@ -39,13 +42,15 @@
 extern crate std;
 
 mod glimpse_;
+mod fade_;
 mod snapshot_;
 
-pub use glimpse_::{Glimpse, PeekTask};
+pub use glimpse_::{Glimpse, GlimpsePeekTask};
+pub use fade_::{FadeAsync, FadeFuture};
 pub use snapshot_::{PeekAsync, Snapshot};
 
 pub mod x_deps {
-    pub use pincol;
+    pub use atomic_sync;
 
-    pub use pincol::x_deps::{abs_sync, atomex, atomic_sync, pin_utils};
+    pub use atomic_sync::x_deps::{abs_sync, atomex, pin_utils};
 }

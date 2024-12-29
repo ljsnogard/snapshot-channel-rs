@@ -2,164 +2,256 @@ use core::{
     borrow::Borrow,
     fmt,
     future::{Future, IntoFuture},
-    marker::PhantomData,
+    marker::PhantomPinned,
+    ops::{Deref, DerefMut, Try},
     pin::Pin,
     ptr::{self, NonNull},
-    task::{Context, Poll},
+    sync::atomic::{AtomicPtr, AtomicUsize},
+    task::{Context, Poll, Waker},
 };
 
 use pin_project::pin_project;
 use pin_utils::pin_mut;
 
-use abs_sync::cancellation::{
-    NonCancellableToken, TrCancellationToken, TrIntoFutureMayCancel,
+use abs_sync::{
+    cancellation::{
+        CancelledToken, NonCancellableToken,
+        TrCancellationToken, TrIntoFutureMayCancel,
+    },
+    sync_tasks::TrSyncTask,
 };
-use atomex::{StrictOrderings, TrAtomicFlags, TrCmpxchOrderings};
-use pincol::x_deps::{abs_sync, atomex, pin_utils};
+use atomex::{AtomexPtr, StrictOrderings, TrAtomicFlags, TrCmpxchOrderings};
+use atomic_sync::{
+    rwlock::preemptive::SpinningRwLockBorrowed,
+    x_deps::{abs_sync, atomex, pin_utils}
+};
 
-use crate::glimpse_::FutOrOutProj;
-use super::glimpse_::{FutOrOut, Glimpse, StUtils, PeekTask, WakerSlot};
+use super::glimpse_::{
+    FutOrOut, FutOrOutProj,
+    Glimpse, SnapshotError, StUtils,
+};
 
-/// The viewer of the channel output
-pub struct Snapshot<B, F, O = StrictOrderings>
+pub(super) type AtomexGlimpsePtr<F, O> =
+    AtomexPtr<Glimpse<F, O>, AtomicPtr<Glimpse<F, O>>, O>;
+
+pub(super) type AtomexSnapshotPtr<F, O> =
+    AtomexPtr<Snapshot<F, O>, AtomicPtr<Snapshot<F, O>>, O>;
+
+pub(super) type SnapshotRwlock<'a, F, O> =
+    SpinningRwLockBorrowed<'a, Pin<&'a mut Snapshot<F, O>>, AtomicUsize, O>;
+
+/// To capture the output of the glimpse's future.
+pub struct Snapshot<F, O = StrictOrderings>
 where
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {
-    glimpse_ref_: B,
-    waker_slot_: WakerSlot<O>,
-    _unused_f_: PhantomData<NonNull<Glimpse<F, O>>>,
+    rwlock_stat_: AtomicUsize,
+    glimpse_ptr_: AtomexGlimpsePtr<F, O>,
+    prev_: AtomexSnapshotPtr<F, O>,
+    next_: AtomexSnapshotPtr<F, O>,
+    wake_: Option<Waker>,
+    _pin_: PhantomPinned,
 }
 
-impl<B, F, O> Snapshot<B, F, O>
+impl<F, O> Snapshot<F, O>
 where
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {
-    pub const fn new(glimpse: B) -> Self {
+    pub(super) const fn new(glimpse: *const Glimpse<F, O>) -> Self {
         Snapshot {
-            glimpse_ref_: glimpse,
-            waker_slot_: WakerSlot::new(Option::None),
-            _unused_f_: PhantomData,
+            rwlock_stat_: AtomicUsize::new(0),
+            glimpse_ptr_: AtomexGlimpsePtr::new(AtomicPtr::new(glimpse as _)),
+            prev_: AtomexSnapshotPtr::new(AtomicPtr::new(ptr::null_mut())),
+            next_: AtomexSnapshotPtr::new(AtomicPtr::new(ptr::null_mut())),
+            wake_: Option::None,
+            _pin_: PhantomPinned,
         }
     }
 
     #[inline]
-    pub fn glimpse(&self) -> &Glimpse<F, O> {
-        self.glimpse_ref_.borrow()
-    }
-
-    #[inline]
-    pub fn is_ready(&self) -> bool {
-        let v = self.glimpse().state().value();
-        StUtils::expect_future_ready(v)
-    }
-
-    #[inline]
-    pub fn try_peek(&self) -> Option<&F::Output> {
-        self.glimpse().try_peek()
-    }
-
-    #[inline]
-    pub fn spin_peek(&self) -> PeekTask<'_, F, O> {
-        self.glimpse().spin_peek()
-    }
-
-    pub fn peek_async(mut self: Pin<&mut Self>) -> PeekAsync<'_, B, F, O> {
-        let mut this_ptr = unsafe {
-            NonNull::new_unchecked(self.as_mut().get_unchecked_mut())
-        };
-        let slot_ref = unsafe { &this_ptr.as_ref().waker_slot_ };
-        if let Option::Some(q) = slot_ref.attached_list() {
-            let mut slot_ptr = unsafe {
-                let p = &mut this_ptr.as_mut().waker_slot_;
-                NonNull::new_unchecked(p)
-            };
-            let mutex = q.mutex();
-            let acq = mutex.acquire();
-            pin_mut!(acq);
-            let mut g = acq.lock().wait();
-            let slot_pin = unsafe { Pin::new_unchecked(slot_ptr.as_mut()) };
-            let Option::Some(mut cursor) = (*g).as_mut().find(slot_pin) else {
-                unreachable!()
-            };
-            assert!(cursor.try_detach());
-            let slot_mut = unsafe {
-                // Safe because the slot is detached, and no alias
-                &mut this_ptr.as_mut().waker_slot_
-            };
-            *slot_mut = WakerSlot::new(Option::None);
+    pub fn try_peek(&self) -> Result<Option<&F::Output>, SnapshotError> {
+        let cancel = CancelledToken::pinned();
+        match self.spin_peek().may_cancel_with(cancel) {
+            Result::Ok(x) => Result::Ok(Option::Some(x)),
+            Result::Err(SnapshotError::Cancelled) => Result::Ok(Option::None),
+            Result::Err(e) => Result::Err(e),
         }
-        PeekAsync(unsafe { Pin::new_unchecked(self.get_unchecked_mut()) })
+    }
+
+    #[inline]
+    pub fn spin_peek(&self) -> SnapshotPeekTask<'_, F, O> {
+        SnapshotPeekTask::new(self)
+    }
+
+    #[inline]
+    pub fn peek_async(self: Pin<&mut Self>) -> PeekAsync<'_, F, O> {
+        PeekAsync(self)
+    }
+
+    pub(super) fn rwlock_(&self) -> SnapshotRwlock<'_, F, O> {
+        unsafe {
+            let this = self as *const Self as *mut Self;
+            let data = Pin::new_unchecked(&mut (*this));
+            let cell = &mut (*this).rwlock_stat_;
+            SnapshotRwlock::new(data, cell)
+        }
+    }
+
+    pub(super) fn try_find_head_<C: TrCancellationToken>(
+        &self,
+        cancel: Pin<&mut C>,
+    ) -> Result<&Self, SnapshotError> {
+        let mut curr = self;
+        loop {
+            let curr_rwlock = curr.rwlock_();
+            let curr_acq = curr_rwlock.acquire();
+            pin_mut!(curr_acq);
+            let opt_g = curr_acq.try_read();
+            let Option::Some(g) = opt_g else {
+                if cancel.is_cancelled() {
+                    break Result::Err(SnapshotError::Cancelled);
+                } else {
+                    continue;
+                }
+            };
+            let opt_prev = (*g).as_ref().get_ref().prev_.load();
+            let Option::Some(prev) = opt_prev else {
+                break Result::Ok(curr);
+            };
+            curr = unsafe { prev.as_ref() };
+        }
     }
 }
 
-impl<B, F, O> Clone for Snapshot<B, F, O>
+impl<F, O> Clone for Snapshot<F, O>
 where
-    B: Clone + Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {
     fn clone(&self) -> Self {
-        Snapshot::new(self.glimpse_ref_.clone())
+        Snapshot::new(ptr::null_mut())
     }
 }
 
-impl<B, F, O> fmt::Debug for Snapshot<B, F, O>
+impl<F, O> fmt::Debug for Snapshot<F, O>
 where
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     F::Output: fmt::Debug,
     O: TrCmpxchOrderings,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Snapshot({:?})", self.glimpse())
+        let prev = self.prev_.pointer();
+        let next = self.next_.pointer();
+        write!(f, "Snapshot[{self:p}, prev({prev:p}), next({next:p})")?;
+        if let Option::Some(glimpse) = self.glimpse_ptr_.load() {
+            let x = unsafe { glimpse.as_ref() };
+            write!(f, ", glimpse({x:?})]")?;
+        }
+        write!(f, "]")
     }
 }
 
-unsafe impl<B, F, O> Send for Snapshot<B, F, O>
+unsafe impl<F, O> Send for Snapshot<F, O>
 where
-    B: Clone + Borrow<Glimpse<F, O>>,
     F: Send + Sync + Future,
     O: TrCmpxchOrderings,
 {}
 
-unsafe impl<B, F, O> Sync for Snapshot<B, F, O>
+unsafe impl<F, O> Sync for Snapshot<F, O>
 where
-    B: Clone + Borrow<Glimpse<F, O>>,
     F: Send + Sync + Future,
     O: TrCmpxchOrderings,
 {}
 
-pub struct PeekAsync<'a, B, F, O>(Pin<&'a mut Snapshot<B, F, O>>)
+pub struct SnapshotPeekTask<'a, F, O>(&'a Snapshot<F, O>)
 where
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings;
 
-impl<'a, B, F, O> PeekAsync<'a, B, F, O>
+impl<'a, F, O> SnapshotPeekTask<'a, F, O>
 where
-    B: Borrow<Glimpse<F, O>>,
+    F: Future,
+    O: TrCmpxchOrderings,
+{
+    pub const fn new(snapshot: &'a Snapshot<F, O>) -> Self {
+        SnapshotPeekTask(snapshot)
+    }
+
+    pub fn may_cancel_with<C: TrCancellationToken>(
+        self,
+        mut cancel: Pin<&mut C>,
+    ) -> Result<&'a F::Output, SnapshotError> {
+        let head = self.0.try_find_head_(cancel.as_mut())?;
+        let rwlock = head.rwlock_();
+        let acq = rwlock.acquire();
+        pin_mut!(acq);
+        let opt_g = acq.read().may_cancel_with(cancel.as_mut());
+        let Option::Some(g) = opt_g else {
+            return Result::Err(SnapshotError::Cancelled);
+        };
+        let Option::Some(glimpse) = g.glimpse_ptr_.load() else {
+            return Result::Err(SnapshotError::GlimpseMissing);
+        };
+        // Safe because by design glimpse has to reset all glimpse_ptr_
+        // before it is dropped.
+        let glimpse = unsafe { glimpse.as_ref() };
+        self.0.glimpse_ptr_.store(glimpse as *const _ as *mut Glimpse<F, O>);
+
+        let opt_x = glimpse.spin_peek().may_cancel_with(cancel);
+        let Option::Some(x) = opt_x else {
+            return Result::Err(SnapshotError::Cancelled);
+        };
+        Result::Ok(x)
+    }
+
+    #[inline]
+    pub fn wait(self) -> &'a F::Output {
+        TrSyncTask::wait(self)
+    }
+}
+
+impl<'a, F, O> TrSyncTask for SnapshotPeekTask<'a, F, O>
+where
+    F: Future,
+    O: TrCmpxchOrderings,
+{
+    type Output = &'a F::Output;
+
+    #[inline]
+    fn may_cancel_with<C: TrCancellationToken>(
+        self,
+        cancel: Pin<&mut C>,
+    ) -> impl Try<Output = Self::Output> {
+        SnapshotPeekTask::may_cancel_with(self, cancel)
+    }
+}
+
+pub struct PeekAsync<'a, F, O>(Pin<&'a mut Snapshot<F, O>>)
+where
+    F: Future,
+    O: TrCmpxchOrderings;
+
+impl<'a, F, O> PeekAsync<'a, F, O>
+where
     F: Future,
     O: TrCmpxchOrderings,
 {
     pub fn may_cancel_with<C: TrCancellationToken>(
         self,
         cancel: Pin<&'a mut C>,
-    ) -> PeekFuture<'a, C, B, F, O> {
+    ) -> PeekFuture<'a, C, F, O> {
         PeekFuture::new(self.0, cancel)
     }
 }
 
-impl<'a, B, F, O> IntoFuture for PeekAsync<'a, B, F, O>
+impl<'a, F, O> IntoFuture for PeekAsync<'a, F, O>
 where
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {
-    type IntoFuture = PeekFuture<'a, NonCancellableToken, B, F, O>;
+    type IntoFuture = PeekFuture<'a, NonCancellableToken, F, O>;
     type Output = Option<&'a F::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -168,9 +260,8 @@ where
     }
 }
 
-impl<'a, B, F, O> TrIntoFutureMayCancel<'a> for PeekAsync<'a, B, F, O>
+impl<'a, F, O> TrIntoFutureMayCancel<'a> for PeekAsync<'a, F, O>
 where
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {
@@ -189,26 +280,24 @@ where
 }
 
 #[pin_project]
-pub struct PeekFuture<'a, C, B, F, O>
+pub struct PeekFuture<'a, C, F, O>
 where
     C: TrCancellationToken,
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {
-    snapshot_: Pin<&'a mut Snapshot<B, F, O>>,
+    snapshot_: Pin<&'a mut Snapshot<F, O>>,
     cancel_: Pin<&'a mut C>,
 }
 
-impl<'a, C, B, F, O> PeekFuture<'a, C, B, F, O>
+impl<'a, C, F, O> PeekFuture<'a, C, F, O>
 where
     C: TrCancellationToken,
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {
     pub const fn new(
-        snapshot: Pin<&'a mut Snapshot<B, F, O>>,
+        snapshot: Pin<&'a mut Snapshot<F, O>>,
         cancel: Pin<&'a mut C>,
     ) -> Self {
         PeekFuture {
@@ -218,10 +307,9 @@ where
     }
 }
 
-impl<'a, C, B, F, O> Future for PeekFuture<'a, C, B, F, O>
+impl<'a, C, F, O> Future for PeekFuture<'a, C, F, O>
 where
     C: TrCancellationToken,
-    B: Borrow<Glimpse<F, O>>,
     F: Future,
     O: TrCmpxchOrderings,
 {

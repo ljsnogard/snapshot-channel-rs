@@ -1,12 +1,12 @@
 use core::{
     fmt,
     future::Future,
-    marker::PhantomData,
+    marker::{PhantomData, PhantomPinned},
     mem,
     ops::Try,
     pin::Pin,
-    ptr::NonNull,
-    sync::atomic::AtomicUsize, 
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicPtr, AtomicUsize},
     task::Waker,
 };
 
@@ -18,16 +18,15 @@ use abs_sync::{
     sync_tasks::TrSyncTask,
 };
 use atomex::{StrictOrderings, TrAtomicFlags, TrCmpxchOrderings};
-use atomic_sync::mutex::embedded::{MsbAsMutexSignal, SpinningMutexBorrowed};
-use pincol::{
-    linked_list::{PinnedList, PinnedSlot},
-    x_deps::{abs_sync, atomex, atomic_sync, pin_utils},
+use atomic_sync::{
+    mutex::embedded::{MsbAsMutexSignal, SpinningMutexBorrowed},
+    x_deps::{abs_sync, atomex, pin_utils},
 };
 
-use crate::Snapshot;
-
-pub(super) type WakeQueue<O> = PinnedList<Option<Waker>, O>;
-pub(super) type WakerSlot<O> = PinnedSlot<Option<Waker>, O>;
+use crate::{
+    fade_::FadeAsync,
+    snapshot_::{AtomexSnapshotPtr, Snapshot},
+};
 
 pub(super) type FutOrOutMutex<'a, F, O> = SpinningMutexBorrowed<
     'a,
@@ -37,6 +36,14 @@ pub(super) type FutOrOutMutex<'a, F, O> = SpinningMutexBorrowed<
     O,
 >;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotError {
+    Cancelled,
+    StandingBy,
+    GlimpseFaded,
+    GlimpseMissing,
+}
+
 /// A glimpse captures the output of a future, and may spawn some snapshots.
 #[repr(C)]
 pub struct Glimpse<F, O = StrictOrderings>
@@ -45,8 +52,10 @@ where
     O: TrCmpxchOrderings,
 {
     stat_flags_: GlimpseState<O>,
-    wake_queue_: WakeQueue<O>,
+    head_waker_: AtomexSnapshotPtr<F, O>,
+    fade_waker_: Option<Waker>,
     fut_or_out_: FutOrOut<F>,
+    _pin_: PhantomPinned,
 }
 
 impl<F, O> Glimpse<F, O>
@@ -55,10 +64,13 @@ where
     O: TrCmpxchOrderings,
 {
     pub const fn new(future: F) -> Self {
+        let np = ptr::null_mut();
         Glimpse {
             stat_flags_: GlimpseState::new(),
-            wake_queue_: PinnedList::new(),
+            head_waker_: AtomexSnapshotPtr::new(AtomicPtr::new(np)),
+            fade_waker_: Option::None,
             fut_or_out_: FutOrOut::new(future),
+            _pin_: PhantomPinned,
         }
     }
 
@@ -66,16 +78,23 @@ where
         self.spin_peek().may_cancel_with(CancelledToken::pinned())
     }
 
-    pub fn spin_peek(&self) -> PeekTask<'_, F, O> {
-        PeekTask(self)
+    pub fn spin_peek(&self) -> GlimpsePeekTask<'_, F, O> {
+        GlimpsePeekTask(self)
     }
 
-    pub fn snapshot(&self) -> Snapshot<&Self, F, O> {
-        Snapshot::new(self)
+    pub fn snapshot(&self) -> Snapshot<F, O> {
+        Snapshot::new(self as _)
     }
 
-    pub(super) const fn wake_queue(&self) -> &WakeQueue<O> {
-        &self.wake_queue_
+    /// To keep the glimpse alive until the future becomes ready and all the
+    /// snapshots are dropped.
+    pub fn fade_async(mut self: Pin<&mut Self>) -> FadeAsync<'_, F, O> {
+        unsafe {
+            self.as_mut()
+                .get_unchecked_mut()
+                .fade_waker_ = Option::None;
+        };
+        FadeAsync::new(self)
     }
 
     pub(super) fn mutex(&self) -> FutOrOutMutex<'_, F, O> {
@@ -126,6 +145,19 @@ where
     }
 }
 
+impl<F, O> Drop for Glimpse<F, O>
+where
+    F: Future,
+    O: TrCmpxchOrderings,
+{
+    fn drop(&mut self) {
+        let Result::Ok(head) = self.head_waker_.try_reset() else {
+            return;
+        };
+        let head = unsafe { head.as_ref() };
+    }
+}
+
 impl<F, O> fmt::Debug for Glimpse<F, O>
 where
     F: Future,
@@ -155,16 +187,20 @@ where
 
 /// The synchronized task to loop and check if the future held by the `Glimpse`
 /// is ready and peek the reference of its output.
-pub struct PeekTask<'a, F, O>(&'a Glimpse<F, O>)
+pub struct GlimpsePeekTask<'a, F, O>(&'a Glimpse<F, O>)
 where
     F: Future,
     O: TrCmpxchOrderings;
 
-impl<'a, F, O> PeekTask<'a, F, O>
+impl<'a, F, O> GlimpsePeekTask<'a, F, O>
 where
     F: Future,
     O: TrCmpxchOrderings,
 {
+    pub const fn new(glimpse: &'a Glimpse<F, O>) -> Self {
+        GlimpsePeekTask(&glimpse)
+    }
+
     pub fn glimpse(&self) -> &Glimpse<F, O> {
         self.0
     }
@@ -193,7 +229,7 @@ where
     }
 }
 
-impl<'a, F, O> TrSyncTask for PeekTask<'a, F, O>
+impl<'a, F, O> TrSyncTask for GlimpsePeekTask<'a, F, O>
 where
     F: Future,
     O: TrCmpxchOrderings,
@@ -208,7 +244,7 @@ where
     where
         C: TrCancellationToken
     {
-        PeekTask::may_cancel_with(self, cancel)
+        GlimpsePeekTask::may_cancel_with(self, cancel)
     }
 }
 
@@ -298,7 +334,6 @@ where
 #[cfg(test)]
 mod tests_ {
     use core::future;
-    use pincol::x_deps::pin_utils::pin_mut;
 
     use super::*;
 
@@ -351,6 +386,7 @@ mod tests_ {
         let glimpse = Glimpse::<_, StrictOrderings>::new(rx.recv());
         let snapshot = glimpse.snapshot();
         let snapshot_cloned = snapshot.clone();
+        pin_mut!(glimpse);
 
         assert!(snapshot.try_peek().is_none());
         assert!(snapshot_cloned.try_peek().is_none());
@@ -366,6 +402,8 @@ mod tests_ {
 
         // Multiple times of peek_async is legal and idempotent
         assert!(snapshot.peek_async().await.is_some());
+
+        assert!(glimpse.fade_async().await.is_ok());
     }
 
     #[tokio::test]
