@@ -51,10 +51,10 @@ where
     F: Future,
     O: TrCmpxchOrderings,
 {
-    stat_flags_: GlimpseState<O>,
-    head_waker_: AtomexSnapshotPtr<F, O>,
-    fade_waker_: Option<Waker>,
-    fut_or_out_: FutOrOut<F>,
+    stat_: GlimpseState<O>,
+    head_: AtomexSnapshotPtr<F, O>,
+    fade_: Option<Waker>,
+    fout_: FutOrOut<F>,
     _pin_: PhantomPinned,
 }
 
@@ -66,10 +66,10 @@ where
     pub const fn new(future: F) -> Self {
         let np = ptr::null_mut();
         Glimpse {
-            stat_flags_: GlimpseState::new(),
-            head_waker_: AtomexSnapshotPtr::new(AtomicPtr::new(np)),
-            fade_waker_: Option::None,
-            fut_or_out_: FutOrOut::new(future),
+            stat_: GlimpseState::new(),
+            head_: AtomexSnapshotPtr::new(AtomicPtr::new(np)),
+            fade_: Option::None,
+            fout_: FutOrOut::new(future),
             _pin_: PhantomPinned,
         }
     }
@@ -82,8 +82,12 @@ where
         GlimpsePeekTask(self)
     }
 
-    pub fn snapshot(&self) -> Snapshot<F, O> {
-        Snapshot::new(self as _)
+    pub fn snapshot(self: Pin<&mut Self>) -> Snapshot<F, O> {
+        if let Option::Some(head) = self.head_snapshot_() {
+            todo!()
+        } else {
+            Snapshot::head(self.as_ref().get_ref())
+        }
     }
 
     /// To keep the glimpse alive until the future becomes ready and all the
@@ -92,9 +96,13 @@ where
         unsafe {
             self.as_mut()
                 .get_unchecked_mut()
-                .fade_waker_ = Option::None;
+                .fade_ = Option::None;
         };
         FadeAsync::new(self)
+    }
+
+    pub(super) fn head_snapshot_(&self) -> Option<NonNull<Snapshot<F, O>>> {
+        self.head_.load()
     }
 
     pub(super) fn mutex(&self) -> FutOrOutMutex<'_, F, O> {
@@ -104,14 +112,14 @@ where
             p.as_mut()
         };
         let f_pin = unsafe {
-            Pin::new_unchecked(&mut this_mut.fut_or_out_)
+            Pin::new_unchecked(&mut this_mut.fout_)
         };
-        let cell = &mut this_mut.stat_flags_.0;
+        let cell = &mut this_mut.stat_.0;
         FutOrOutMutex::new(f_pin, cell)
     }
 
     pub(super) fn state(&self) -> &GlimpseState<O> {
-        &self.stat_flags_
+        &self.stat_
     }
 
     pub(super) fn wake_all(&self) {
@@ -151,7 +159,7 @@ where
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
-        let Result::Ok(head) = self.head_waker_.try_reset() else {
+        let Result::Ok(head) = self.head_.try_reset() else {
             return;
         };
         let head = unsafe { head.as_ref() };
@@ -210,9 +218,9 @@ where
         cancel: Pin<&mut C>,
     ) -> Option<&'a F::Output> {
         loop {
-            let v = self.0.stat_flags_.value();
+            let v = self.0.stat_.value();
             if StUtils::expect_future_ready(v) {
-                let FutOrOut::Out(x) = &self.0.fut_or_out_ else {
+                let FutOrOut::Out(x) = &self.0.fout_ else {
                     unreachable!()
                 };
                 break Option::Some(x);
@@ -357,7 +365,7 @@ mod tests_ {
     fn glimpse_state_msb_should_change_on_mutex_acq() {
         let glimpse = Glimpse::<_, StrictOrderings>
             ::new(future::pending::<()>());
-        let state = &glimpse.stat_flags_;
+        let state = &glimpse.stat_;
         let v = state.value();
         // a new glimpse has released mutex state.
         assert!(StUtils::expect_mutex_released(v));

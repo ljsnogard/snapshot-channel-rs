@@ -40,18 +40,32 @@ pub(super) type AtomexSnapshotPtr<F, O> =
 pub(super) type SnapshotRwlock<'a, F, O> =
     SpinningRwLockBorrowed<'a, Pin<&'a mut Snapshot<F, O>>, AtomicUsize, O>;
 
-/// To capture the output of the glimpse's future.
-pub struct Snapshot<F, O = StrictOrderings>
+pub(super) enum SnapshotLink<F, O = StrictOrderings>
 where
     F: Future,
     O: TrCmpxchOrderings,
 {
-    rwlock_stat_: AtomicUsize,
-    glimpse_ptr_: AtomexGlimpsePtr<F, O>,
-    prev_: AtomexSnapshotPtr<F, O>,
-    next_: AtomexSnapshotPtr<F, O>,
-    wake_: Option<Waker>,
+    Head {
+        glimpse_: AtomexGlimpsePtr<F, O>,
+        next_: AtomexSnapshotPtr<F, O>,
+        tail_: AtomexSnapshotPtr<F, O>,
+    },
+    Node {
+        prev_: AtomexSnapshotPtr<F, O>,
+        next_: AtomexSnapshotPtr<F, O>,
+    }
+}
+
+/// To capture the output of the glimpse's future.
+pub struct Snapshot<F, O>
+where
+    F: Future,
+    O: TrCmpxchOrderings,
+{
     _pin_: PhantomPinned,
+    lock_: AtomicUsize,
+    wake_: Option<Waker>,
+    link_: SnapshotLink<F, O>,
 }
 
 impl<F, O> Snapshot<F, O>
@@ -59,14 +73,31 @@ where
     F: Future,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(glimpse: *const Glimpse<F, O>) -> Self {
+    pub(super) const fn head(glimpse: *const Glimpse<F, O>) -> Self {
         Snapshot {
-            rwlock_stat_: AtomicUsize::new(0),
-            glimpse_ptr_: AtomexGlimpsePtr::new(AtomicPtr::new(glimpse as _)),
-            prev_: AtomexSnapshotPtr::new(AtomicPtr::new(ptr::null_mut())),
-            next_: AtomexSnapshotPtr::new(AtomicPtr::new(ptr::null_mut())),
-            wake_: Option::None,
             _pin_: PhantomPinned,
+            lock_: AtomicUsize::new(0),
+            wake_: Option::None,
+            link_: SnapshotLink::Head {
+                glimpse_: AtomexGlimpsePtr::new(AtomicPtr::new(glimpse as _)),
+                next_: AtomexSnapshotPtr::new(AtomicPtr::new(ptr::null_mut())),
+                tail_: AtomexSnapshotPtr::new(AtomicPtr::new(ptr::null_mut())),
+            },
+        }
+    }
+
+    pub(super) const fn node(
+        prev: *const Snapshot<F, O>,
+        next: *const Snapshot<F, O>,
+    ) -> Self {
+        Snapshot {
+            _pin_: PhantomPinned,
+            lock_: AtomicUsize::new(0),
+            wake_: Option::None,
+            link_: SnapshotLink::Node {
+                prev_: AtomexSnapshotPtr::new(AtomicPtr::new(prev as _)),
+                next_: AtomexSnapshotPtr::new(AtomicPtr::new(next as _)),
+            },
         }
     }
 
@@ -94,7 +125,7 @@ where
         unsafe {
             let this = self as *const Self as *mut Self;
             let data = Pin::new_unchecked(&mut (*this));
-            let cell = &mut (*this).rwlock_stat_;
+            let cell = &mut (*this).lock_;
             SnapshotRwlock::new(data, cell)
         }
     }
@@ -116,11 +147,35 @@ where
                     continue;
                 }
             };
-            let opt_prev = (*g).as_ref().get_ref().prev_.load();
+            if let Option::Some(glimpse) = g.glimpse_ptr_.load() {
+                let glimpse = unsafe { glimpse.as_ref() };
+                let opt_head = glimpse.head_snapshot_();
+                if let Option::Some(head) = opt_head {
+                    break Result::Ok(unsafe { head.as_ref() })
+                }
+            }
+            let opt_prev = g.prev_.load();
             let Option::Some(prev) = opt_prev else {
                 break Result::Ok(curr);
             };
             curr = unsafe { prev.as_ref() };
+        }
+    }
+
+    pub(super) fn try_init_waker_(
+        self: Pin<&mut Self>,
+        get_waker: impl FnOnce() -> Waker,
+    ) -> Result<&Waker, &Waker> {
+        let mut this_ptr = unsafe { 
+            NonNull::new_unchecked(self.get_unchecked_mut())
+        };
+        let opt_existing = unsafe { this_ptr.as_ref().wake_.as_ref() };
+        if let Option::Some(existing) = opt_existing {
+            Result::Err(existing)
+        } else {
+            let this_mut = unsafe { this_ptr.as_mut() };
+            this_mut.wake_.replace(get_waker());
+            Result::Ok(this_mut.wake_.as_ref().unwrap())
         }
     }
 }
@@ -131,7 +186,7 @@ where
     O: TrCmpxchOrderings,
 {
     fn clone(&self) -> Self {
-        Snapshot::new(ptr::null_mut())
+        Snapshot::new(self.glimpse_ptr_.pointer())
     }
 }
 
@@ -184,19 +239,23 @@ where
         mut cancel: Pin<&mut C>,
     ) -> Result<&'a F::Output, SnapshotError> {
         let head = self.0.try_find_head_(cancel.as_mut())?;
-        let rwlock = head.rwlock_();
-        let acq = rwlock.acquire();
-        pin_mut!(acq);
-        let opt_g = acq.read().may_cancel_with(cancel.as_mut());
+        let head_lock = head.rwlock_();
+        let head_acq = head_lock.acquire();
+        pin_mut!(head_acq);
+        let opt_g = head_acq.read().may_cancel_with(cancel.as_mut());
         let Option::Some(g) = opt_g else {
             return Result::Err(SnapshotError::Cancelled);
         };
         let Option::Some(glimpse) = g.glimpse_ptr_.load() else {
             return Result::Err(SnapshotError::GlimpseMissing);
         };
-        // Safe because by design glimpse has to reset all glimpse_ptr_
-        // before it is dropped.
+        // This is safe because by design glimpse has to reset all glimpse_ptr_
+        // before it is dropped, and resetting glimpse_ptr_ has to acquire and
+        // keep the writer guard of the head snapshot's rwlock. That means the
+        // `NonNull` pointer of the head snapshot is still valid.
         let glimpse = unsafe { glimpse.as_ref() };
+        // So we are safely to store the `glimpse` pointer into `glimpse_ptr_`
+        // until it is being reset.
         self.0.glimpse_ptr_.store(glimpse as *const _ as *mut Glimpse<F, O>);
 
         let opt_x = glimpse.spin_peek().may_cancel_with(cancel);
@@ -313,11 +372,11 @@ where
     F: Future,
     O: TrCmpxchOrderings,
 {
-    type Output = Option<&'a F::Output>;
+    type Output = Result<&'a F::Output, SnapshotError>;
 
     /// ## Possible situations:
-    /// 1. Slot not queued: then we simply enqueue the slot, and poll the 
-    ///     future of cancellation for later wake up;
+    /// 1. Snapshot not queued: then we simply enqueue it, and poll the future
+    ///     of cancellation for later wake up;
     /// 2. Slot has enqueued but not the first one to poll the future stored
     ///     within the `Glimpse`: just return pending;
     /// 3. Slot has enqueued and become the first one to poll the future stored
@@ -329,8 +388,21 @@ where
             NonNull::new_unchecked(p)
         };
         let snapshot_ref = unsafe { snapshot_ptr.as_ref() };
-        let glimpse: &'a Glimpse<F, O> = snapshot_ref.glimpse_ref_.borrow();
-        let q_mutex = glimpse.wake_queue().mutex();
+        let this_rwlock = snapshot_ref.rwlock_();
+        let this_acq = this_rwlock.acquire();
+        pin_mut!(this_acq);
+        let cancel = this.cancel_.as_mut();
+
+        // This should not take too long to acquire the writer guard.
+        let opt_write = this_acq.as_mut().write().may_cancel_with(cancel);
+        let Option::Some(mut write) = opt_write else {
+            return Poll::Ready(Result::Err(SnapshotError::Cancelled));
+        };
+        let Option::Some(glimpse_ptr) = write.glimpse_ptr_.load() else {
+            return Poll::Ready(Result::Err(SnapshotError::GlimpseMissing));
+        };
+
+
         loop {
             let opt_q = snapshot_ref.waker_slot_.attached_list();
             if let Option::Some(q) = opt_q {
